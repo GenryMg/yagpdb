@@ -15,6 +15,7 @@ import (
 	"github.com/jonas747/dcmd"
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/dstate"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/commands"
 	"github.com/jonas747/yagpdb/common"
 	"github.com/jonas747/yagpdb/common/templates"
@@ -77,6 +78,9 @@ func (p *Plugin) AddCommands() {
 
 			subject := parsed.Args[0].Str()
 			id, channel, err := createTicketChannel(conf, parsed.GS, parsed.Msg.Author.ID, subject)
+			if err != nil {
+				return "Failed creating the channel, make sure the bot has proper perms and the channel limit hasn't been reached.", nil
+			}
 
 			// create the db model for it
 			dbModel := &models.Ticket{
@@ -96,7 +100,7 @@ func (p *Plugin) AddCommands() {
 
 			// send the first ticket message
 
-			tmplCTX := templates.NewContext(parsed.GS, dstate.NewChannelState(parsed.GS, parsed.GS, channel), commands.ContextMS(parsed.Context()))
+			tmplCTX := templates.NewContext(parsed.GS, dstate.NewChannelState(parsed.GS, parsed.GS, channel), parsed.MS)
 			tmplCTX.Name = "ticket open message"
 			tmplCTX.Data["Reason"] = parsed.Args[0].Str()
 			ticketOpenMsg := conf.TicketOpenMSG
@@ -391,6 +395,10 @@ func (p *Plugin) AddCommands() {
 					}
 
 					conf = &models.TicketConfig{}
+				}
+
+				if conf.Enabled {
+					go analytics.RecordActiveUnit(data.GS.ID, &Plugin{}, "cmd_used")
 				}
 
 				activeTicket, err := models.Tickets(qm.Where("channel_id = ? AND guild_id = ?", data.CS.ID, data.GS.ID)).OneG(data.Context())

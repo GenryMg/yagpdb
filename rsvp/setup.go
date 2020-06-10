@@ -3,19 +3,21 @@ package rsvp
 import (
 	"context"
 	"fmt"
-	"github.com/jonas747/discordgo"
-	"github.com/jonas747/yagpdb/bot"
-	"github.com/jonas747/yagpdb/common"
-	"github.com/jonas747/yagpdb/common/scheduledevents2"
-	"github.com/jonas747/yagpdb/rsvp/models"
-	"github.com/jonas747/yagpdb/timezonecompanion"
-	"github.com/volatiletech/sqlboiler/boil"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/jonas747/discordgo"
+	"github.com/jonas747/dstate"
+	"github.com/jonas747/yagpdb/bot"
+	"github.com/jonas747/yagpdb/common"
+	"github.com/jonas747/yagpdb/common/scheduledevents2"
+	"github.com/jonas747/yagpdb/rsvp/models"
+	"github.com/jonas747/yagpdb/timezonecompanion"
+	"github.com/volatiletech/sqlboiler/boil"
 )
 
 type SetupState int
@@ -130,14 +132,14 @@ func (s *SetupSession) handleMessageSetupStateChannel(m *discordgo.Message) {
 		return
 	}
 
-	perms, err := gs.MemberPermissions(true, targetChannel, s.AuthorID)
+	hasPerms, err := bot.AdminOrPermMS(targetChannel, dstate.MSFromDGoMember(gs, m.Member), discordgo.PermissionSendMessages)
 	if err != nil {
 		s.sendMessage("Failed retrieving your pems, check with bot owner")
 		logger.WithError(err).WithField("guild", gs.ID).Error("failed calculating permissions")
 		return
 	}
 
-	if (perms & discordgo.PermissionSendMessages) == 0 {
+	if !hasPerms {
 		s.sendMessage("You don't have permissions to send messages there, please pick another channel")
 		return
 	}
@@ -345,7 +347,7 @@ func (s *SetupSession) remove() {
 }
 
 func (s *SetupSession) sendMessage(msgf string, args ...interface{}) {
-	m, err := common.BotSession.ChannelMessageSend(s.SetupChannel, "[RSVP Event Setup]: "+common.EscapeSpecialMentions(fmt.Sprintf(msgf, args...)))
+	m, err := common.BotSession.ChannelMessageSend(s.SetupChannel, "[RSVP Event Setup]: "+fmt.Sprintf(msgf, args...))
 	if err != nil {
 		logger.WithError(err).WithField("guild", s.GuildID).WithField("channel", s.SetupChannel).Error("failed sending setup message")
 	} else {

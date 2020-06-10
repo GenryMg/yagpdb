@@ -12,10 +12,13 @@ import (
 
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/go-reddit"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/common"
 	"github.com/jonas747/yagpdb/common/config"
 	"github.com/jonas747/yagpdb/common/mqueue"
+	"github.com/jonas747/yagpdb/feeds"
 	"github.com/jonas747/yagpdb/reddit/models"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/sirupsen/logrus"
 	"github.com/volatiletech/sqlboiler/queries/qm"
 	"golang.org/x/oauth2"
@@ -183,10 +186,10 @@ func (p *PostHandlerImpl) handlePost(post *reddit.Link, filterGuild int64) error
 
 		mqueue.QueueMessage(qm)
 
-		if common.Statsd != nil {
-			go common.Statsd.Count("yagpdb.reddit.matches", 1, []string{"subreddit:" + post.Subreddit, "guild:" + strconv.FormatInt(item.GuildID, 10)}, 1)
-		}
+		feeds.MetricPostedMessages.With(prometheus.Labels{"source": "reddit"}).Inc()
+		go analytics.RecordActiveUnit(item.GuildID, &Plugin{}, "posted_reddit_message")
 	}
+
 	return nil
 }
 
@@ -238,13 +241,28 @@ func CreatePostMessage(post *reddit.Link) (string, *discordgo.MessageEmbed) {
 		html.UnescapeString(post.Title), post.Author, "https://redd.it/"+post.ID)
 
 	plainBody := ""
+	parentSpoiler := false
 	if post.IsSelf {
 		plainBody = common.CutStringShort(html.UnescapeString(post.Selftext), 250)
+	} else if post.CrosspostParent != "" && len(post.CrosspostParentList) > 0 {
+		// Handle cross posts
+		parent := post.CrosspostParentList[0]
+		plainBody += "**" + html.UnescapeString(parent.Title) + "**\n"
+
+		if parent.IsSelf {
+			plainBody += common.CutStringShort(html.UnescapeString(parent.Selftext), 250)
+		} else {
+			plainBody += parent.URL
+		}
+
+		if parent.Spoiler {
+			parentSpoiler = true
+		}
 	} else {
 		plainBody = post.URL
 	}
 
-	if post.Spoiler {
+	if post.Spoiler || parentSpoiler {
 		plainMessage += "|| " + plainBody + " ||"
 	} else {
 		plainMessage += plainBody
@@ -264,6 +282,7 @@ func CreatePostMessage(post *reddit.Link) (string, *discordgo.MessageEmbed) {
 	embed.URL = "https://redd.it/" + post.ID
 
 	if post.IsSelf {
+		//  Handle Self posts
 		embed.Title = "New self post"
 		if post.Spoiler {
 			embed.Description += "|| " + common.CutStringShort(html.UnescapeString(post.Selftext), 250) + " ||"
@@ -272,12 +291,37 @@ func CreatePostMessage(post *reddit.Link) (string, *discordgo.MessageEmbed) {
 		}
 
 		embed.Color = 0xc3fc7e
+	} else if post.CrosspostParent != "" && len(post.CrosspostParentList) > 0 {
+		//  Handle crossposts
+		embed.Title = "New Crosspost"
+
+		parent := post.CrosspostParentList[0]
+		embed.Description += "**" + html.UnescapeString(parent.Title) + "**\n"
+		if parent.IsSelf {
+			// Cropsspost was a self post
+			embed.Color = 0xc3fc7e
+			if parent.Spoiler {
+				embed.Description += "|| " + common.CutStringShort(html.UnescapeString(parent.Selftext), 250) + " ||"
+			} else {
+				embed.Description += common.CutStringShort(html.UnescapeString(parent.Selftext), 250)
+			}
+		} else {
+			// cross post was a link most likely
+			embed.Color = 0x718aed
+			embed.Description += parent.URL
+			if parent.Media.Type == "" && !parent.Spoiler && parent.PostHint == "image" {
+				embed.Image = &discordgo.MessageEmbedImage{
+					URL: parent.URL,
+				}
+			}
+		}
 	} else {
+		//  Handle Link posts
 		embed.Color = 0x718aed
 		embed.Title = "New link post"
 		embed.Description += post.URL
 
-		if post.Media.Type == "" && !post.Spoiler {
+		if post.Media.Type == "" && !post.Spoiler && post.PostHint == "image" {
 			embed.Image = &discordgo.MessageEmbedImage{
 				URL: post.URL,
 			}
@@ -288,7 +332,7 @@ func CreatePostMessage(post *reddit.Link) (string, *discordgo.MessageEmbed) {
 		embed.Title += " [spoiler]"
 	}
 
-	plainMessage = common.EscapeSpecialMentions(plainMessage)
+	plainMessage = plainMessage
 	return plainMessage, embed
 }
 

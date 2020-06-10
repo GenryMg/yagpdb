@@ -12,6 +12,7 @@ import (
 	"github.com/jonas747/dcmd"
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/dstate"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/bot"
 	"github.com/jonas747/yagpdb/bot/paginatedmessages"
 	"github.com/jonas747/yagpdb/commands"
@@ -28,11 +29,10 @@ func MBaseCmd(cmdData *dcmd.Data, targetID int64) (config *Config, targetUser *d
 	if targetID != 0 {
 		targetMember, _ := bot.GetMember(cmdData.GS.ID, targetID)
 		if targetMember != nil {
-			authorMember := commands.ContextMS(cmdData.Context())
 			gs := cmdData.GS
 
 			gs.RLock()
-			above := bot.IsMemberAbove(gs, authorMember, targetMember)
+			above := bot.IsMemberAbove(gs, cmdData.MS, targetMember)
 			gs.RUnlock()
 
 			if !above {
@@ -66,11 +66,12 @@ func MBaseCmdSecond(cmdData *dcmd.Data, reason string, reasonArgOptional bool, n
 		oreason = "(No reason specified)"
 	}
 
+	member := cmdData.MS
+
 	// check permissions or role setup for this command
 	permsMet := false
 	if len(additionalPermRoles) > 0 {
 		// Check if the user has one of the required roles
-		member := commands.ContextMS(cmdData.Context())
 		for _, r := range member.Roles {
 			if common.ContainsInt64Slice(additionalPermRoles, r) {
 				permsMet = true
@@ -81,13 +82,15 @@ func MBaseCmdSecond(cmdData *dcmd.Data, reason string, reasonArgOptional bool, n
 
 	if !permsMet && neededPerm != 0 {
 		// Fallback to legacy permissions
-		hasPerms, err := bot.AdminOrPermMS(commands.ContextMS(cmdData.Context()), cmdData.CS.ID, neededPerm)
+		hasPerms, err := bot.AdminOrPermMS(cmdData.CS.ID, member, neededPerm)
 		if err != nil || !hasPerms {
 			return oreason, commands.NewUserErrorf("The **%s** command requires the **%s** permission in this channel or additional roles set up by admins, you don't have it. (if you do contact bot support)", cmdName, common.StringPerms[neededPerm])
 		}
 
 		permsMet = true
 	}
+
+	go analytics.RecordActiveUnit(cmdData.GS.ID, &Plugin{}, "executed_cmd_"+cmdName)
 
 	return oreason, nil
 }
@@ -214,6 +217,9 @@ var ModerationCommands = []*commands.YAGCommand{
 			if parsed.Args[1].Value != nil {
 				d = parsed.Args[1].Value.(time.Duration)
 			}
+			if d > 0 && d < time.Minute {
+				d = time.Minute
+			}
 
 			logger.Info(d.Seconds())
 
@@ -302,7 +308,7 @@ var ModerationCommands = []*commands.YAGCommand{
 
 			reportBody := fmt.Sprintf("<@%d> Reported <@%d> in <#%d> For `%s`\nLast 100 messages from channel: <%s>", parsed.Msg.Author.ID, target, parsed.Msg.ChannelID, parsed.Args[1].Str(), logLink)
 
-			_, err = common.BotSession.ChannelMessageSend(channelID, common.EscapeSpecialMentions(reportBody))
+			_, err = common.BotSession.ChannelMessageSend(channelID, reportBody)
 			if err != nil {
 				return nil, err
 			}
@@ -497,11 +503,16 @@ var ModerationCommands = []*commands.YAGCommand{
 		Name:          "Warnings",
 		Description:   "Lists warning of a user.",
 		Aliases:       []string{"Warns"},
-		RequiredArgs:  1,
+		RequiredArgs:  0,
 		Arguments: []*dcmd.ArgDef{
-			&dcmd.ArgDef{Name: "User", Type: dcmd.UserID},
+			&dcmd.ArgDef{Name: "User", Type: dcmd.UserID, Default: 0},
+			&dcmd.ArgDef{Name: "Page", Type: &dcmd.IntArg{Max: 10000}, Default: 0},
+		},
+		ArgSwitches: []*dcmd.ArgDef{
+			&dcmd.ArgDef{Switch: "id", Name: "Warning ID", Type: dcmd.Int},
 		},
 		RunFunc: func(parsed *dcmd.Data) (interface{}, error) {
+			var err error
 			config, _, err := MBaseCmd(parsed, 0)
 			if err != nil {
 				return nil, err
@@ -512,27 +523,31 @@ var ModerationCommands = []*commands.YAGCommand{
 				return nil, err
 			}
 
-			userID := parsed.Args[0].Int64()
-
-			var result []*WarningModel
-			err = common.GORM.Where("user_id = ? AND guild_id = ?", userID, parsed.GS.ID).Order("id desc").Find(&result).Error
-			if err != nil && err != gorm.ErrRecordNotFound {
-				return nil, err
-			}
-
-			if len(result) < 1 {
-				return "This user has not received any warnings", nil
-			}
-
-			out := ""
-			for _, entry := range result {
-				out += fmt.Sprintf("#%d: `%20s` **%s** (%13s) - **%s**\n", entry.ID, entry.CreatedAt.Format(time.RFC822), entry.AuthorUsernameDiscrim, entry.AuthorID, entry.Message)
-				if entry.LogsLink != "" {
-					out += "^logs: <" + entry.LogsLink + ">\n"
+			if parsed.Switches["id"].Value != nil {
+				var warn []*WarningModel
+				err = common.GORM.Where("guild_id = ? AND id = ?", parsed.GS.ID, parsed.Switches["id"].Int()).First(&warn).Error
+				if err != nil && err != gorm.ErrRecordNotFound {
+					return nil, err
 				}
-			}
+				if len(warn) == 0 {
+					return fmt.Sprintf("Warning with given id : `%d` does not exist.", parsed.Switches["id"].Int()), nil
+				}
 
-			return out, nil
+				return &discordgo.MessageEmbed{
+					Title:       fmt.Sprintf("Warning#%d - User : %s", warn[0].ID, warn[0].UserID),
+					Description: fmt.Sprintf("`%20s` - **Reason** : %s", warn[0].CreatedAt.UTC().Format(time.RFC822), warn[0].Message),
+					Footer:      &discordgo.MessageEmbedFooter{Text: fmt.Sprintf("By: %s (%13s)", warn[0].AuthorUsernameDiscrim, warn[0].AuthorID)},
+				}, nil
+			}
+			page := parsed.Args[1].Int()
+			if page < 1 {
+				page = 1
+			}
+			if parsed.Context().Value(paginatedmessages.CtxKeyNoPagination) != nil {
+				return PaginateWarnings(parsed)(nil, page)
+			}
+			_, err = paginatedmessages.CreatePaginatedMessage(parsed.GS.ID, parsed.CS.ID, page, 0, PaginateWarnings(parsed))
+			return nil, err
 		},
 	},
 	&commands.YAGCommand{
@@ -657,7 +672,7 @@ var ModerationCommands = []*commands.YAGCommand{
 				return nil, err
 			}
 
-			if len(entries) < 1 && p.LastResponse != nil { //Don't send No Results error on first execution.
+			if len(entries) < 1 && p != nil && p.LastResponse != nil { //Don't send No Results error on first execution.
 				return nil, paginatedmessages.ErrNoResults
 			}
 
@@ -721,9 +736,8 @@ var ModerationCommands = []*commands.YAGCommand{
 				return "Couldn't find the specified role", nil
 			}
 
-			authorMember := commands.ContextMS(parsed.Context())
 			parsed.GS.RLock()
-			if !bot.IsMemberAboveRole(parsed.GS, authorMember, role) {
+			if !bot.IsMemberAboveRole(parsed.GS, parsed.MS, role) {
 				parsed.GS.RUnlock()
 				return "Can't give roles above you", nil
 			}
@@ -755,7 +769,7 @@ var ModerationCommands = []*commands.YAGCommand{
 				if dur > 0 {
 					action.Footer = "Duration: " + common.HumanizeDuration(common.DurationPrecisionMinutes, dur)
 				}
-				CreateModlogEmbed(config.IntActionChannel(), parsed.Msg.Author, action, target, "", "")
+				CreateModlogEmbed(config, parsed.Msg.Author, action, target, "", "")
 			}
 
 			return GenericCmdResp(action, target, dur, true, dur <= 0), nil
@@ -794,9 +808,8 @@ var ModerationCommands = []*commands.YAGCommand{
 				return "Couldn't find the specified role", nil
 			}
 
-			authorMember := commands.ContextMS(parsed.Context())
 			parsed.GS.RLock()
-			if !bot.IsMemberAboveRole(parsed.GS, authorMember, role) {
+			if !bot.IsMemberAboveRole(parsed.GS, parsed.MS, role) {
 				parsed.GS.RUnlock()
 				return "Can't remove roles above you", nil
 			}
@@ -813,7 +826,7 @@ var ModerationCommands = []*commands.YAGCommand{
 			action := MARemoveRole
 			action.Prefix = "Removed the role " + role.Name + " from "
 			if config.GiveRoleCmdModlog && config.IntActionChannel() != 0 {
-				CreateModlogEmbed(config.IntActionChannel(), parsed.Msg.Author, action, target, "", "")
+				CreateModlogEmbed(config, parsed.Msg.Author, action, target, "", "")
 			}
 
 			return GenericCmdResp(action, target, 0, true, true), nil
@@ -933,4 +946,71 @@ func FindRole(gs *dstate.GuildState, roleS string) *discordgo.Role {
 
 	// couldn't find the role :(
 	return nil
+}
+
+func PaginateWarnings(parsed *dcmd.Data) func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
+
+	return func(p *paginatedmessages.PaginatedMessage, page int) (*discordgo.MessageEmbed, error) {
+
+		var err error
+		skip := (page - 1) * 6
+		userID := parsed.Args[0].Int64()
+		limit := 6
+
+		var result []*WarningModel
+		var count int
+		err = common.GORM.Table("moderation_warnings").Where("user_id = ? AND guild_id = ?", userID, parsed.GS.ID).Count(&count).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return nil, err
+		}
+		err = common.GORM.Where("user_id = ? AND guild_id = ?", userID, parsed.GS.ID).Order("id desc").Offset(skip).Limit(limit).Find(&result).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return nil, err
+		}
+
+		if len(result) < 1 && p != nil && p.LastResponse != nil { //Dont send No Results error on first execution
+			return nil, paginatedmessages.ErrNoResults
+		}
+
+		desc := fmt.Sprintf("**Total :** `%d`", count)
+		var fields []*discordgo.MessageEmbedField
+		currentField := &discordgo.MessageEmbedField{
+			Name:  "⠀", //Use braille blank character for seamless transition between feilds
+			Value: "",
+		}
+		fields = append(fields, currentField)
+		if len(result) > 0 {
+
+			for _, entry := range result {
+
+				entry_formatted := fmt.Sprintf("#%d: `%20s` - By: **%s** (%13s) \n **Reason:** %s", entry.ID, entry.CreatedAt.UTC().Format(time.RFC822), entry.AuthorUsernameDiscrim, entry.AuthorID, entry.Message)
+				if len([]rune(entry_formatted)) > 900 {
+					entry_formatted = common.CutStringShort(entry_formatted, 900)
+				}
+				entry_formatted += "\n"
+				if entry.LogsLink != "" {
+					entry_formatted += fmt.Sprintf("> logs: [`link`](%s)\n", entry.LogsLink)
+				}
+
+				if len([]rune(currentField.Value+entry_formatted)) > 1023 {
+					currentField = &discordgo.MessageEmbedField{
+						Name:  "⠀",
+						Value: entry_formatted + "\n",
+					}
+					fields = append(fields, currentField)
+				} else {
+					currentField.Value += entry_formatted + "\n"
+				}
+			}
+
+		} else {
+			currentField.Value = "No Warnings"
+		}
+
+		return &discordgo.MessageEmbed{
+			Title:       fmt.Sprintf("Warnings - User : %d", userID),
+			Description: desc,
+			Fields:      fields,
+		}, nil
+	}
 }

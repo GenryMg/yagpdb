@@ -4,6 +4,10 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"math"
+	"strings"
+	"time"
+
 	"github.com/jonas747/dcmd"
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/yagpdb/bot"
@@ -13,9 +17,6 @@ import (
 	"github.com/jonas747/yagpdb/common"
 	"github.com/jonas747/yagpdb/timezonecompanion/models"
 	"github.com/volatiletech/sqlboiler/boil"
-	"math"
-	"strings"
-	"time"
 )
 
 var _ bot.BotInitHandler = (*Plugin)(nil)
@@ -26,7 +27,7 @@ func (p *Plugin) BotInit() {
 }
 
 func (p *Plugin) AddCommands() {
-	commands.AddRootCommands(&commands.YAGCommand{
+	commands.AddRootCommands(p, &commands.YAGCommand{
 		CmdCategory: commands.CategoryTool,
 		Name:        "settimezone",
 		Aliases:     []string{"setz", "tzset"},
@@ -62,18 +63,21 @@ func (p *Plugin) AddCommands() {
 				return userTZ, nil
 			}
 
-			if parsed.Switches["d"].Value != nil && parsed.Switches["d"].Value.(bool) && getUserTZ != nil {
-				m := &models.UserTimezone{
-					UserID:       parsed.Msg.Author.ID,
-					TimezoneName: localTZ.String(),
+			if parsed.Switches["d"].Value != nil && parsed.Switches["d"].Value.(bool) {
+				if getUserTZ != nil {
+
+					m := &models.UserTimezone{
+						UserID:       parsed.Msg.Author.ID,
+						TimezoneName: localTZ.String(),
+					}
+					_, err := m.DeleteG(parsed.Context())
+					if err != nil {
+						return nil, err
+					}
+					return "Deleted", nil
+				} else {
+					return "You don't have a registered time zone", nil
 				}
-				_, err := m.DeleteG(parsed.Context())
-				if err != nil {
-					return nil, err
-				}
-				return "Deleted", nil
-			} else if parsed.Switches["d"].Value != nil && parsed.Switches["d"].Value.(bool) {
-				return "You don't have a registered time zone", nil
 			}
 
 			zones := FindZone(parsed.Args[0].Str())
@@ -83,6 +87,9 @@ func (p *Plugin) AddCommands() {
 
 			if len(zones) > 1 {
 				if len(zones) > 10 {
+					if parsed.Context().Value(paginatedmessages.CtxKeyNoPagination) != nil {
+						return paginatedTimezones(zones)(nil, 1)
+					}
 					_, err := paginatedmessages.CreatePaginatedMessage(
 						parsed.GS.ID, parsed.CS.ID, 1, int(math.Ceil(float64(len(zones))/10)), paginatedTimezones(zones))
 					return nil, err
@@ -298,6 +305,11 @@ func appendIfNotExists(in []string, elem string) []string {
 func (p *Plugin) handleMessageCreate(evt *eventsystem.EventData) {
 	m := evt.MessageCreate()
 	if m.GuildID == 0 {
+		return
+	}
+
+	//Additional check to ensure not reacting to own message
+	if m.Author.ID == common.BotUser.ID {
 		return
 	}
 

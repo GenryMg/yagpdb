@@ -10,10 +10,12 @@ import (
 
 	"github.com/jinzhu/gorm"
 	"github.com/jonas747/discordgo"
-	"github.com/jonas747/retryableredis"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/common"
 	"github.com/jonas747/yagpdb/common/mqueue"
+	"github.com/jonas747/yagpdb/feeds"
 	"github.com/mediocregopher/radix/v3"
+	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/oauth2/google"
 	"google.golang.org/api/googleapi"
 	"google.golang.org/api/youtube/v3"
@@ -106,7 +108,7 @@ func (p *Plugin) checkExpiringWebsubs() {
 	maxScore := time.Now().Unix()
 
 	var expiring []string
-	err = common.RedisPool.Do(retryableredis.FlatCmd(&expiring, "ZRANGEBYSCORE", RedisKeyWebSubChannels, "-inf", maxScore))
+	err = common.RedisPool.Do(radix.FlatCmd(&expiring, "ZRANGEBYSCORE", RedisKeyWebSubChannels, "-inf", maxScore))
 	if err != nil {
 		logger.WithError(err).Error("Failed checking websubs")
 		return
@@ -130,7 +132,7 @@ func (p *Plugin) syncWebSubs() {
 	defer common.UnlockRedisKey(RedisChannelsLockKey)
 
 	var activeChannels []string
-	err = common.RedisPool.Do(retryableredis.Cmd(&activeChannels, "ZRANGEBYSCORE", "youtube_subbed_channels", "-inf", "+inf"))
+	err = common.RedisPool.Do(radix.Cmd(&activeChannels, "ZRANGEBYSCORE", "youtube_subbed_channels", "-inf", "+inf"))
 	if err != nil {
 		logger.WithError(err).Error("Failed syncing websubs, failed retrieving subbed channels")
 		return
@@ -139,7 +141,7 @@ func (p *Plugin) syncWebSubs() {
 	common.RedisPool.Do(radix.WithConn(RedisKeyWebSubChannels, func(client radix.Conn) error {
 		for _, channel := range activeChannels {
 			mn := radix.MaybeNil{}
-			client.Do(retryableredis.Cmd(&mn, "ZSCORE", RedisKeyWebSubChannels, channel))
+			client.Do(radix.Cmd(&mn, "ZSCORE", RedisKeyWebSubChannels, channel))
 			if mn.Nil {
 				// Not added
 				err := p.WebSubSubscribe(channel)
@@ -157,7 +159,7 @@ func (p *Plugin) syncWebSubs() {
 
 func (p *Plugin) checkChannels() error {
 	var channels []string
-	err := common.RedisPool.Do(retryableredis.FlatCmd(&channels, "ZRANGE", "youtube_subbed_channels", 0, MaxChannelsPerPoll))
+	err := common.RedisPool.Do(radix.FlatCmd(&channels, "ZRANGE", "youtube_subbed_channels", 0, MaxChannelsPerPoll))
 	if err != nil {
 		return err
 	}
@@ -213,7 +215,7 @@ func (p *Plugin) checkChannel(channel string) error {
 
 	// Find the last video time for this channel
 	var unixSeconds int64
-	err = common.RedisPool.Do(retryableredis.Cmd(&unixSeconds, "GET", KeyLastVidTime(channel)))
+	err = common.RedisPool.Do(radix.Cmd(&unixSeconds, "GET", KeyLastVidTime(channel)))
 
 	var lastProcessedVidTime time.Time
 	if err != nil || unixSeconds == 0 {
@@ -222,13 +224,13 @@ func (p *Plugin) checkChannel(channel string) error {
 		}
 
 		lastProcessedVidTime = time.Now()
-		common.RedisPool.Do(retryableredis.FlatCmd(nil, "SET", KeyLastVidTime(channel), lastProcessedVidTime.Unix()))
+		common.RedisPool.Do(radix.FlatCmd(nil, "SET", KeyLastVidTime(channel), lastProcessedVidTime.Unix()))
 	} else {
 		lastProcessedVidTime = time.Unix(unixSeconds, 0)
 	}
 
 	var lastVidID string
-	common.RedisPool.Do(retryableredis.Cmd(&lastVidID, "GET", KeyLastVidID(channel)))
+	common.RedisPool.Do(radix.Cmd(&lastVidID, "GET", KeyLastVidID(channel)))
 
 	// latestVid is used to set the last vid id and time
 	var latestVid *youtube.PlaylistItem
@@ -280,15 +282,15 @@ func (p *Plugin) checkChannel(channel string) error {
 		nextPage = resp.NextPageToken
 	}
 
-	common.RedisPool.Do(retryableredis.FlatCmd(nil, "ZADD", "youtube_subbed_channels", now.Unix(), channel))
+	common.RedisPool.Do(radix.FlatCmd(nil, "ZADD", "youtube_subbed_channels", now.Unix(), channel))
 
 	// Update the last vid id and time if needed
-	if latestVid != nil && lastVidID != latestVid.Id {
+	if latestVid != nil {
 		parsedTime, _ := time.Parse(time.RFC3339, latestVid.Snippet.PublishedAt)
-		if !lastProcessedVidTime.After(parsedTime) {
+		if !lastProcessedVidTime.After(parsedTime) && (latestVid.Id != lastVidID || parsedTime.Unix() != lastProcessedVidTime.Unix()) {
 			common.MultipleCmds(
-				retryableredis.FlatCmd(nil, "SET", KeyLastVidTime(channel), parsedTime.Unix()),
-				retryableredis.FlatCmd(nil, "SET", KeyLastVidID(channel), latestVid.Id),
+				radix.FlatCmd(nil, "SET", KeyLastVidTime(channel), parsedTime.Unix()),
+				radix.FlatCmd(nil, "SET", KeyLastVidID(channel), latestVid.Id),
 			)
 		}
 	}
@@ -326,22 +328,27 @@ func (p *Plugin) handlePlaylistItemsResponse(resp *youtube.PlaylistItemListRespo
 			go p.sendNewVidMessage(sub.GuildID, sub.ChannelID, item.Snippet.ChannelTitle, item.Snippet.ResourceId.VideoId, sub.MentionEveryone)
 		}
 
-		if common.Statsd != nil {
-			go common.Statsd.Count("yagpdb.youtube.matches", int64(len(subs)), nil, 1)
-		}
+		feeds.MetricPostedMessages.With(prometheus.Labels{"source": "youtube"}).Add(float64(len(subs)))
 	}
 
 	return
 }
 
 func (p *Plugin) sendNewVidMessage(guild, discordChannel string, channelTitle string, videoID string, mentionEveryone bool) {
-	content := common.EscapeMentionsFromOutsideSource(fmt.Sprintf("**%s** uploaded a new youtube video!\n%s", channelTitle, "https://www.youtube.com/watch?v="+videoID))
+	content := fmt.Sprintf("**%s** uploaded a new youtube video!\n%s", channelTitle, "https://www.youtube.com/watch?v="+videoID)
 	if mentionEveryone {
 		content += " @everyone"
 	}
 
 	parsedChannel, _ := strconv.ParseInt(discordChannel, 10, 64)
 	parsedGuild, _ := strconv.ParseInt(guild, 10, 64)
+
+	parseMentions := []discordgo.AllowedMentionType{}
+	if mentionEveryone {
+		parseMentions = []discordgo.AllowedMentionType{discordgo.AllowedMentionTypeEveryone}
+	}
+
+	go analytics.RecordActiveUnit(parsedGuild, p, "posted_youtube_message")
 
 	mqueue.QueueMessage(&mqueue.QueuedElement{
 		Guild:      parsedGuild,
@@ -350,6 +357,9 @@ func (p *Plugin) sendNewVidMessage(guild, discordChannel string, channelTitle st
 		SourceID:   "",
 		MessageStr: content,
 		Priority:   2,
+		AllowedMentions: discordgo.AllowedMentions{
+			Parse: parseMentions,
+		},
 	})
 }
 
@@ -456,9 +466,9 @@ func (p *Plugin) MaybeRemoveChannelWatch(channel string) {
 	}
 
 	err = common.MultipleCmds(
-		retryableredis.Cmd(nil, "ZREM", "youtube_subbed_channels", channel),
-		retryableredis.Cmd(nil, "DEL", KeyLastVidTime(channel)),
-		retryableredis.Cmd(nil, "DEL", KeyLastVidID(channel)),
+		radix.Cmd(nil, "ZREM", "youtube_subbed_channels", channel),
+		radix.Cmd(nil, "DEL", KeyLastVidTime(channel)),
+		radix.Cmd(nil, "DEL", KeyLastVidID(channel)),
 	)
 
 	if err != nil {
@@ -486,7 +496,7 @@ func (p *Plugin) MaybeAddChannelWatch(lock bool, channel string) error {
 	now := time.Now().Unix()
 
 	mn := radix.MaybeNil{}
-	err := common.RedisPool.Do(retryableredis.Cmd(&mn, "ZSCORE", "youtube_subbed_channels", channel))
+	err := common.RedisPool.Do(radix.Cmd(&mn, "ZSCORE", "youtube_subbed_channels", channel))
 	if err != nil {
 		return common.ErrWithCaller(err)
 	}
@@ -498,8 +508,8 @@ func (p *Plugin) MaybeAddChannelWatch(lock bool, channel string) error {
 	}
 
 	common.MultipleCmds(
-		retryableredis.FlatCmd(nil, "ZADD", "youtube_subbed_channels", now, channel),
-		retryableredis.FlatCmd(nil, "SET", KeyLastVidTime(channel), now),
+		radix.FlatCmd(nil, "ZADD", "youtube_subbed_channels", now, channel),
+		radix.FlatCmd(nil, "SET", KeyLastVidTime(channel), now),
 	)
 
 	// Also add websub subscription

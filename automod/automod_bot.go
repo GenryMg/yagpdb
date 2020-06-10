@@ -8,6 +8,7 @@ import (
 
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/dstate"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/automod/models"
 	"github.com/jonas747/yagpdb/bot"
 	"github.com/jonas747/yagpdb/bot/eventsystem"
@@ -36,16 +37,17 @@ type ResetChannelRatelimitData struct {
 }
 
 func (p *Plugin) handleMsgUpdate(evt *eventsystem.EventData) {
-	p.checkMessage(evt.MessageUpdate().Message)
+	p.checkMessage(evt, evt.MessageUpdate().Message)
 }
 
 // called on new messages and edits
-func (p *Plugin) checkMessage(msg *discordgo.Message) bool {
+func (p *Plugin) checkMessage(evt *eventsystem.EventData, msg *discordgo.Message) bool {
 	if !bot.IsNormalUserMessage(msg) {
-		// message edits can have a nil author, those are embed edits
-		// check against a discrim of 0000 to avoid some cases on webhook messages where webhook_id is 0, even tough its a webhook
-		// discrim is in those 0000 which is a invalid user discrim. (atleast when i was testing)
 		return false
+	}
+
+	if !evt.HasFeatureFlag(featureFlagEnabled) || msg.GuildID == 0 {
+		return true
 	}
 
 	cs := bot.State.Channel(true, msg.ChannelID)
@@ -386,6 +388,8 @@ func (p *Plugin) CheckConditions(ctxData *TriggeredRuleData, conditions []*Parse
 func (p *Plugin) RulesetRulesTriggeredCondsPassed(ruleset *ParsedRuleset, triggeredRules []*ParsedRule, ctxData *TriggeredRuleData) {
 
 	loggedModels := make([]*models.AutomodTriggeredRule, len(triggeredRules))
+
+	go analytics.RecordActiveUnit(ruleset.RSModel.GuildID, p, "rule_triggered")
 
 	// apply the effects
 	for i, rule := range triggeredRules {

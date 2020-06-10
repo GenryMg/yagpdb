@@ -12,7 +12,10 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/premium"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 
 	"emperror.dev/errors"
 	"github.com/jonas747/dcmd"
@@ -53,7 +56,7 @@ var _ bot.BotInitHandler = (*Plugin)(nil)
 var _ commands.CommandProvider = (*Plugin)(nil)
 
 func (p *Plugin) AddCommands() {
-	commands.AddRootCommands(cmdListCommands)
+	commands.AddRootCommands(p, cmdListCommands)
 }
 
 func (p *Plugin) BotInit() {
@@ -100,18 +103,18 @@ var cmdListCommands = &commands.YAGCommand{
 		if err != nil {
 			return "Failed retrieving custom commands", err
 		}
-		
+
 		groups, err := models.CustomCommandGroups(qm.Where("guild_id=?", data.GS.ID)).AllG(data.Context())
 		if err != nil {
 			return "Failed retrieving custom command groups", err
 		}
-		
+
 		groupMap := make(map[int64]string)
 		groupMap[0] = "Ungrouped"
 		for _, group := range groups {
 			groupMap[group.ID] = group.Name
 		}
-		
+
 		foundCCS, provided := FindCommands(ccs, data)
 		if len(foundCCS) < 1 {
 			list := StringCommands(ccs, groupMap)
@@ -130,7 +133,7 @@ var cmdListCommands = &commands.YAGCommand{
 		}
 
 		cc := foundCCS[0]
-		
+
 		if cc.TextTrigger != "" {
 			return fmt.Sprintf("#%d - %s: `%s` - Case sensitive trigger: `%t` - Group: `%s`\n```\n%s\n```", cc.LocalID, CommandTriggerType(cc.TriggerType), cc.TextTrigger, cc.TextTriggerCaseSensitive, groupMap[cc.GroupID.Int64], strings.Join(cc.Responses, "```\n```")), nil
 		} else {
@@ -239,6 +242,8 @@ func handleDelayedRunCC(evt *schEventsModels.ScheduledEvent, data interface{}) (
 		tmplCtx.Data["ExecData"] = i
 	}
 
+	metricsExecutedCommands.With(prometheus.Labels{"trigger": "timed"}).Inc()
+
 	err = ExecuteCustomCommand(cmd, tmplCtx)
 	return false, err
 }
@@ -270,6 +275,8 @@ func handleNextRunScheduledEVent(evt *schEventsModels.ScheduledEvent, data inter
 		return false, nil
 	}
 
+	metricsExecutedCommands.With(prometheus.Labels{"trigger": "timed"}).Inc()
+
 	tmplCtx := templates.NewContext(gs, cs, nil)
 	ExecuteCustomCommand(cmd, tmplCtx)
 
@@ -293,13 +300,15 @@ func shouldIgnoreChannel(evt *discordgo.MessageCreate, cState *dstate.ChannelSta
 		return true
 	}
 
-	botID := common.BotUser.ID
-
-	if evt.Author == nil || botID == evt.Author.ID || evt.Author.Bot || cState.IsPrivate || evt.WebhookID != 0 {
+	if !bot.IsNormalUserMessage(evt.Message) {
 		return true
 	}
 
-	if !bot.BotProbablyHasPermissionGS(true, cState.Guild, cState.ID, discordgo.PermissionSendMessages) {
+	if evt.Message.Author.Bot {
+		return true
+	}
+
+	if !bot.BotProbablyHasPermissionGS(cState.Guild, cState.ID, discordgo.PermissionSendMessages) {
 		return true
 	}
 
@@ -311,6 +320,11 @@ const (
 	CCMessageExecLimitNormal  = 3
 	CCMessageExecLimitPremium = 5
 )
+
+var metricsExecutedCommands = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "yagpdb_cc_triggered_total",
+	Help: "Number custom commands triggered",
+}, []string{"trigger"})
 
 func handleMessageReactions(evt *eventsystem.EventData) {
 	var reaction *discordgo.MessageReaction
@@ -329,15 +343,7 @@ func handleMessageReactions(evt *eventsystem.EventData) {
 		return
 	}
 
-	ms, err := bot.GetMember(reaction.GuildID, reaction.UserID)
-	if err != nil {
-		if common.IsDiscordErr(err, discordgo.ErrCodeUnknownMember) {
-			// example scenario: removing reactions of a user that's not on the server
-			// (reactions aren't cleared automatically when a user leaves)
-			return
-		}
-
-		logger.WithError(err).WithField("guild", reaction.GuildID).Error("failed fetching guild member")
+	if !evt.HasFeatureFlag(featureFlagHasCommands) {
 		return
 	}
 
@@ -346,22 +352,32 @@ func handleMessageReactions(evt *eventsystem.EventData) {
 		return
 	}
 
-	if !bot.BotProbablyHasPermissionGS(true, cState.Guild, cState.ID, discordgo.PermissionSendMessages) {
+	if !bot.BotProbablyHasPermissionGS(cState.Guild, cState.ID, discordgo.PermissionSendMessages) {
 		// don't run in channel we don't have perms in
 		return
 	}
 
-	triggeredCmds, err := findReactionTriggerCustomCommands(evt.Context(), cState, ms, reaction, added)
-	if common.Statsd != nil {
-		go common.Statsd.Count("yagpdb.cc.executed", int64(len(triggeredCmds)), []string{"trigger:reaction"}, 1)
+	ms, triggeredCmds, err := findReactionTriggerCustomCommands(evt.Context(), cState, reaction.UserID, reaction, added)
+	if err != nil {
+		if common.IsDiscordErr(err, discordgo.ErrCodeUnknownMember) {
+			// example scenario: removing reactions of a user that's not on the server
+			// (reactions aren't cleared automatically when a user leaves)
+			return
+		}
+
+		logger.WithField("guild", evt.GS.ID).WithError(err).Error("failed finding reaction ccs")
+		return
 	}
 
 	if len(triggeredCmds) < 1 {
 		return
 	}
 
+	metricsExecutedCommands.With(prometheus.Labels{"trigger": "reaction"}).Inc()
+
 	rMessage, err := common.BotSession.ChannelMessage(cState.ID, reaction.MessageID)
 	if err != nil {
+		logger.WithField("guild", evt.GS.ID).WithError(err).Error("failed finding reaction ccs")
 		return
 	}
 	rMessage.GuildID = cState.Guild.ID
@@ -379,7 +395,8 @@ func ExecuteCustomCommandFromReaction(cc *models.CustomCommand, ms *dstate.Membe
 
 	// to make sure the message is in the proper context of the user reacting we set the mssage context to a fake message
 	fakeMsg := *message
-	fakeMsg.Author = ms.DGoUser()
+	fakeMsg.Member = ms.DGoCopy()
+	fakeMsg.Author = fakeMsg.Member.User
 	tmplCtx.Msg = &fakeMsg
 
 	tmplCtx.Data["Reaction"] = reaction
@@ -392,15 +409,16 @@ func ExecuteCustomCommandFromReaction(cc *models.CustomCommand, ms *dstate.Membe
 func HandleMessageCreate(evt *eventsystem.EventData) {
 	mc := evt.MessageCreate()
 	cs := evt.CS()
+
+	if !evt.HasFeatureFlag(featureFlagHasCommands) {
+		return
+	}
+
 	if shouldIgnoreChannel(mc, cs) {
 		return
 	}
 
-	member, err := bot.GetMember(cs.Guild.ID, mc.Author.ID)
-	if err != nil {
-		return
-	}
-
+	member := dstate.MSFromDGoMember(evt.GS, mc.Member)
 	matchedCustomCommands, err := findMessageTriggerCustomCommands(evt.Context(), cs, member, mc)
 	if err != nil {
 		logger.WithError(err).Error("Error mathching custom commands")
@@ -411,9 +429,7 @@ func HandleMessageCreate(evt *eventsystem.EventData) {
 		return
 	}
 
-	if common.Statsd != nil {
-		go common.Statsd.Count("yagpdb.cc.executed", int64(len(matchedCustomCommands)), []string{"trigger:message"}, 1)
-	}
+	metricsExecutedCommands.With(prometheus.Labels{"trigger": "message"}).Inc()
 
 	for _, matched := range matchedCustomCommands {
 		err = ExecuteCustomCommandFromMessage(matched.CC, member, cs, matched.Args, matched.Stripped, mc.Message)
@@ -470,15 +486,15 @@ func findMessageTriggerCustomCommands(ctx context.Context, cs *dstate.ChannelSta
 	return matched, nil
 }
 
-func findReactionTriggerCustomCommands(ctx context.Context, cs *dstate.ChannelState, ms *dstate.MemberState, reaction *discordgo.MessageReaction, add bool) (matches []*TriggeredCC, err error) {
+func findReactionTriggerCustomCommands(ctx context.Context, cs *dstate.ChannelState, userID int64, reaction *discordgo.MessageReaction, add bool) (ms *dstate.MemberState, matches []*TriggeredCC, err error) {
 	cmds, err := BotCachedGetCommandsWithMessageTriggers(cs.Guild, ctx)
 	if err != nil {
-		return nil, errors.WrapIf(err, "BotCachedGetCommandsWithMessageTriggers")
+		return nil, nil, errors.WrapIf(err, "BotCachedGetCommandsWithMessageTriggers")
 	}
 
 	var matched []*TriggeredCC
 	for _, cmd := range cmds {
-		if !CmdRunsInChannel(cmd, reaction.ChannelID) || !CmdRunsForUser(cmd, ms) {
+		if !CmdRunsInChannel(cmd, reaction.ChannelID) {
 			continue
 		}
 
@@ -490,18 +506,38 @@ func findReactionTriggerCustomCommands(ctx context.Context, cs *dstate.ChannelSt
 		}
 	}
 
-	sortTriggeredCCs(matched)
+	if len(matched) < 1 {
+		// no matches
+		return nil, matched, nil
+	}
+
+	ms, err = bot.GetMember(cs.Guild.ID, userID)
+	if err != nil {
+		return nil, nil, errors.WithStackIf(err)
+	}
+
+	// filter by roles
+	filtered := make([]*TriggeredCC, 0, len(matched))
+	for _, v := range matched {
+		if !CmdRunsForUser(v.CC, ms) {
+			continue
+		}
+
+		filtered = append(filtered, v)
+	}
+
+	sortTriggeredCCs(filtered)
 
 	limit := CCMessageExecLimitNormal
 	if isPremium, _ := premium.IsGuildPremiumCached(cs.Guild.ID); isPremium {
 		limit = CCMessageExecLimitPremium
 	}
 
-	if len(matched) > limit {
-		matched = matched[:limit]
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
 	}
 
-	return matched, nil
+	return ms, filtered, nil
 }
 
 func sortTriggeredCCs(ccs []*TriggeredCC) {
@@ -568,7 +604,7 @@ func ExecuteCustomCommand(cmd *models.CustomCommand, tmplCtx *templates.Context)
 	tmplCtx.Data["CCID"] = cmd.LocalID
 	tmplCtx.Data["CCRunCount"] = cmd.RunCount + 1
 
-	csCop := tmplCtx.CS.Copy(true)
+	csCop := tmplCtx.CurrentFrame.CS.Copy(true)
 	f := logger.WithFields(logrus.Fields{
 		"trigger":      cmd.TextTrigger,
 		"trigger_type": CommandTriggerType(cmd.TriggerType).String(),
@@ -584,11 +620,16 @@ func ExecuteCustomCommand(cmd *models.CustomCommand, tmplCtx *templates.Context)
 	lockHandle := CCExecLock.Lock(lockKey, time.Minute, time.Minute*10)
 	if lockHandle == -1 {
 		f.Warn("Exceeded max lock attempts for cc")
-		common.BotSession.ChannelMessageSend(tmplCtx.CS.ID, fmt.Sprintf("Gave up trying to execute custom command #%d after 1 minute because there is already one or more instances of it being executed.", cmd.LocalID))
+		if cmd.ShowErrors {
+			common.BotSession.ChannelMessageSend(tmplCtx.CurrentFrame.CS.ID, fmt.Sprintf("Gave up trying to execute custom command #%d after 1 minute because there is already one or more instances of it being executed.", cmd.LocalID))
+		}
+		updatePostCommandRan(cmd, errors.New("Gave up trying to execute, already an existing instance executing"))
 		return nil
 	}
 
 	defer CCExecLock.Unlock(lockKey, lockHandle)
+
+	go analytics.RecordActiveUnit(cmd.GuildID, &Plugin{}, "executed_cc")
 
 	// pick a response and execute it
 	f.Info("Custom command triggered")
@@ -607,40 +648,14 @@ func ExecuteCustomCommand(cmd *models.CustomCommand, tmplCtx *templates.Context)
 		logger.WithField("guild", tmplCtx.GS.ID).WithError(err).Error("Error executing custom command")
 		if cmd.ShowErrors {
 			out += "\nAn error caused the execution of the custom command template to stop:\n"
-			out += "`" + common.EscapeSpecialMentions(err.Error()) + "`"
+			out += "`" + err.Error() + "`"
 		}
 	}
 
-	if !bot.BotProbablyHasPermissionGS(true, tmplCtx.GS, tmplCtx.CS.ID, discordgo.PermissionSendMessages) {
-		// don't bother sending the response if we dont have perms
-		return nil
+	_, err = tmplCtx.SendResponse(out)
+	if err != nil {
+		return errors.WithStackIf(err)
 	}
-
-	for _, v := range tmplCtx.EmebdsToSend {
-		common.BotSession.ChannelMessageSendEmbed(tmplCtx.CS.ID, v)
-	}
-
-	if strings.TrimSpace(out) != "" && (!tmplCtx.DelResponse || tmplCtx.DelResponseDelay > 0) {
-		m, err := common.BotSession.ChannelMessageSend(tmplCtx.CS.ID, out)
-		if err != nil {
-			logger.WithError(err).Error("Failed sending message")
-		} else {
-			if tmplCtx.DelResponse {
-				templates.MaybeScheduledDeleteMessage(tmplCtx.GS.ID, tmplCtx.CS.ID, m.ID, tmplCtx.DelResponseDelay)
-			}
-
-			if len(tmplCtx.AddResponseReactionNames) > 0 {
-				go func() {
-					for _, v := range tmplCtx.AddResponseReactionNames {
-						common.BotSession.MessageReactionAdd(m.ChannelID, m.ID, v)
-					}
-				}()
-			}
-		}
-	}
-
-	// update stats
-
 	return nil
 }
 
@@ -655,9 +670,9 @@ func onExecPanic(cmd *models.CustomCommand, err error, tmplCtx *templates.Contex
 
 	if cmd.ShowErrors {
 		out := "\nAn error caused the execution of the custom command template to stop:\n"
-		out += "`" + common.EscapeSpecialMentions(err.Error()) + "`"
+		out += "`" + err.Error() + "`"
 
-		common.BotSession.ChannelMessageSend(tmplCtx.CS.ID, out)
+		common.BotSession.ChannelMessageSend(tmplCtx.CurrentFrame.CS.ID, out)
 	}
 
 	updatePostCommandRan(cmd, err)
@@ -678,12 +693,12 @@ func updatePostCommandRan(cmd *models.CustomCommand, runErr error) {
 		logger.WithError(err).WithField("guild", cmd.GuildID).Error("failed running post command executed query")
 	}
 
-	if runErr != nil {
-		err := pubsub.Publish("custom_commands_clear_cache", cmd.GuildID, nil)
-		if err != nil {
-			logger.WithError(err).Error("failed creating cache eviction pubsub event in updatePostCommandRan")
-		}
-	}
+	// if runErr != nil {
+	// 	err := pubsub.Publish("custom_commands_clear_cache", cmd.GuildID, nil)
+	// 	if err != nil {
+	// 		logger.WithError(err).Error("failed creating cache eviction pubsub event in updatePostCommandRan")
+	// 	}
+	// }
 }
 
 // CheckMatch returns true if the given cmd matches, as well as the arguments

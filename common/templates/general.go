@@ -35,40 +35,40 @@ func Dictionary(values ...interface{}) (map[interface{}]interface{}, error) {
 }
 
 func StringKeyDictionary(values ...interface{}) (SDict, error) {
-	
+
 	if len(values) == 1 {
 		val, isNil := indirect(reflect.ValueOf(values[0]))
 		if isNil || values[0] == nil {
 			return nil, errors.New("Sdict: nil value passed")
-		} 		
+		}
 
-		if sdict, ok := val.Interface().(SDict); ok {	
+		if sdict, ok := val.Interface().(SDict); ok {
 			return sdict, nil
 		}
-		
-		switch val.Kind() {		
-			case reflect.Map:
-				iter := val.MapRange()
-				mapCopy := make(map[string]interface{})
-				for iter.Next() {
-					
-					key, isNil := indirect(iter.Key())
-					if isNil {
-						return nil, errors.New("map with nil key encountered")
-					}
-					if key.Kind() == reflect.String {
-						mapCopy[key.String()] = iter.Value().Interface()
-					} else {
-						return nil, errors.New("map has non string key of type: " + key.Type().String())
-					}
+
+		switch val.Kind() {
+		case reflect.Map:
+			iter := val.MapRange()
+			mapCopy := make(map[string]interface{})
+			for iter.Next() {
+
+				key, isNil := indirect(iter.Key())
+				if isNil {
+					return nil, errors.New("map with nil key encountered")
 				}
-				return SDict(mapCopy), nil
-			default:
-				return nil, errors.New("cannot convert data of type: " + reflect.TypeOf(values[0]).String())		
+				if key.Kind() == reflect.String {
+					mapCopy[key.String()] = iter.Value().Interface()
+				} else {
+					return nil, errors.New("map has non string key of type: " + key.Type().String())
+				}
+			}
+			return SDict(mapCopy), nil
+		default:
+			return nil, errors.New("cannot convert data of type: " + reflect.TypeOf(values[0]).String())
 		}
-		
+
 	}
-	
+
 	if len(values)%2 != 0 {
 		return nil, errors.New("invalid dict call")
 	}
@@ -107,7 +107,7 @@ func CreateEmbed(values ...interface{}) (*discordgo.MessageEmbed, error) {
 	case map[string]interface{}:
 		m = t
 	case *discordgo.MessageEmbed:
-	        return t, nil
+		return t, nil
 	default:
 		dict, err := StringKeyDictionary(values...)
 		if err != nil {
@@ -134,51 +134,51 @@ func CreateMessageSend(values ...interface{}) (*discordgo.MessageSend, error) {
 	if len(values) < 1 {
 		return &discordgo.MessageSend{}, nil
 	}
-	
+
 	if m, ok := values[0].(*discordgo.MessageSend); len(values) == 1 && ok {
 		return m, nil
 	}
-	
+
 	messageSdict, err := StringKeyDictionary(values...)
 	if err != nil {
 		return nil, err
 	}
-	
+
 	msg := &discordgo.MessageSend{}
-	
+
 	for key, val := range messageSdict {
-	
+
 		switch key {
-			case "content":
-				msg.Content = fmt.Sprint(val)
-			case "embed":
-				if val == nil { 
-					continue
-				}
-				embed, err := CreateEmbed(val)
-				if err != nil {
-					return nil, err
-				}
-				msg.Embed = embed
-			case "file":
-				stringFile := fmt.Sprint(val) 
-				if len(stringFile) > 100000 {
-					return nil, errors.New("file length for send message builder exceeded size limit")
-				}
-				var buf bytes.Buffer
-				buf.WriteString(stringFile)
-				
-				msg.File = &discordgo.File {
-						Name: "Attachment.txt",
-						ContentType: "text/plain",
-						Reader: &buf,
-				}
-			default:
-				return nil, errors.New(`invalid key "` + key + `" passed to send message builder`)
+		case "content":
+			msg.Content = fmt.Sprint(val)
+		case "embed":
+			if val == nil {
+				continue
+			}
+			embed, err := CreateEmbed(val)
+			if err != nil {
+				return nil, err
+			}
+			msg.Embed = embed
+		case "file":
+			stringFile := fmt.Sprint(val)
+			if len(stringFile) > 100000 {
+				return nil, errors.New("file length for send message builder exceeded size limit")
+			}
+			var buf bytes.Buffer
+			buf.WriteString(stringFile)
+
+			msg.File = &discordgo.File{
+				Name:        "Attachment.txt",
+				ContentType: "text/plain",
+				Reader:      &buf,
+			}
+		default:
+			return nil, errors.New(`invalid key "` + key + `" passed to send message builder`)
 		}
 
 	}
-			
+
 	return msg, nil
 }
 
@@ -199,21 +199,21 @@ func CreateMessageEdit(values ...interface{}) (*discordgo.MessageEdit, error) {
 	for key, val := range messageSdict {
 
 		switch key {
-			case "content":
-				temp := fmt.Sprint(val)
-				msg.Content = &temp
-			case "embed":
-				if val == nil { 
-					msg.Embed = (&discordgo.MessageEmbed{}).MarshalNil(true)
-					continue
-				}
-				embed, err := CreateEmbed(val)
-				if err != nil {
-					return nil, err
-				}
-				msg.Embed = embed
-			default:
-				return nil, errors.New(`invalid key "` + key + `" passed to message edit builder`)
+		case "content":
+			temp := fmt.Sprint(val)
+			msg.Content = &temp
+		case "embed":
+			if val == nil {
+				msg.Embed = (&discordgo.MessageEmbed{}).MarshalNil(true)
+				continue
+			}
+			embed, err := CreateEmbed(val)
+			if err != nil {
+				return nil, err
+			}
+			msg.Embed = embed
+		default:
+			return nil, errors.New(`invalid key "` + key + `" passed to message edit builder`)
 		}
 
 	}
@@ -494,24 +494,24 @@ func tmplLog(arguments ...interface{}) (float64, error) {
 }
 
 //tmplHumanizeThousands comma separates thousands
-func tmplHumanizeThousands(input interface{}) string{
-	var f1,f2 string
+func tmplHumanizeThousands(input interface{}) string {
+	var f1, f2 string
 
 	i := tmplToInt(input)
 	str := strconv.Itoa(i)
-	
+
 	idx := 0
-	for i = len(str) -1; i >= 0; i-- {
+	for i = len(str) - 1; i >= 0; i-- {
 		idx++
-		if idx == 4{
+		if idx == 4 {
 			idx = 1
 			f1 = f1 + ","
 		}
-		f1=f1+string(str[i])
+		f1 = f1 + string(str[i])
 	}
 
-	for i=len(f1)-1;i>=0;i--{
-		f2=f2+string(f1[i])
+	for i = len(f1) - 1; i >= 0; i-- {
+		f2 = f2 + string(f1[i])
 	}
 	return f2
 }
@@ -592,8 +592,11 @@ func joinStrings(sep string, args ...interface{}) (string, error) {
 				}
 			}
 
-		case int, int32, uint32, int64, uint64:
+		case int, uint, int32, uint32, int64, uint64:
 			builder.WriteString(ToString(v))
+			
+		case fmt.Stringer:
+			builder.WriteString(t.String())
 
 		}
 
@@ -733,6 +736,10 @@ func ToString(from interface{}) string {
 		return strconv.FormatUint(uint64(t), 10)
 	case uint64:
 		return strconv.FormatUint(uint64(t), 10)
+	case []rune:
+		return string(t)
+	case []byte:
+		return string(t)
 	case string:
 		return t
 	default:
@@ -793,6 +800,28 @@ func ToDuration(from interface{}) time.Duration {
 		return time.Duration(t)
 	default:
 		return 0
+	}
+}
+
+func ToRune(from interface{}) []rune {
+	switch t := from.(type) {
+	case int, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64:
+		return []rune(ToString(t))
+	case string:
+		return []rune(t)
+	default:
+		return nil
+	}
+}
+
+func ToByte(from interface{}) []byte {
+	switch t := from.(type) {
+	case int, int16, int32, int64, uint8, uint16, uint32, uint64, float32, float64:
+		return []byte(ToString(t))
+	case string:
+		return []byte(t)
+	default:
+		return nil
 	}
 }
 
@@ -903,23 +932,22 @@ func slice(item reflect.Value, indices ...reflect.Value) (reflect.Value, error) 
 }
 
 func tmplCurrentTime() time.Time {
-	return time.Now()
+	return time.Now().UTC()
 }
 
-func tmplNewDate(year, monthInt, day, hour, min, sec int) time.Time {
-	var month time.Month
-	month = time.Month(monthInt)
-	return time.Date(year, month, day, hour, min, sec, 0, time.UTC)
-}
+func tmplNewDate(year, monthInt, day, hour, min, sec int, location ...string) (time.Time, error) {
+	loc := time.UTC
+	month := time.Month(monthInt)
 
-func tmplEscapeHere(in string) string {
-	return common.EscapeEveryoneHere(in, false, true)
-}
-func tmplEscapeEveryone(in string) string {
-	return common.EscapeEveryoneHere(in, true, false)
-}
-func tmplEscapeEveryoneHere(in string) string {
-	return common.EscapeEveryoneHere(in, true, true)
+	var err error
+	if len(location) >= 1 {
+		loc, err = time.LoadLocation(location[0])
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+
+	return time.Date(year, month, day, hour, min, sec, 0, loc), nil
 }
 
 func tmplHumanizeDurationHours(in time.Duration) string {

@@ -76,7 +76,7 @@ var Command = &commands.YAGCommand{
 }
 
 func cmdFuncMentionRole(data *dcmd.Data) (interface{}, error) {
-	if ok, err := bot.AdminOrPerm(discordgo.PermissionManageRoles, data.Msg.Author.ID, data.CS.ID); err != nil {
+	if ok, err := bot.AdminOrPermMS(data.CS.ID, data.MS, discordgo.PermissionManageRoles); err != nil {
 		return "Failed checking perms", err
 	} else if !ok {
 		return "You need manage roles perms to use this command", nil
@@ -118,7 +118,13 @@ func cmdFuncMentionRole(data *dcmd.Data) (interface{}, error) {
 		return nil, err
 	}
 
-	_, err = common.BotSession.ChannelMessageSend(cID, "<@&"+discordgo.StrID(role.ID)+"> "+data.Args[1].Str())
+	_, err = common.BotSession.ChannelMessageSendComplex(cID, &discordgo.MessageSend{
+		Content: "<@&" + discordgo.StrID(role.ID) + "> " + data.Args[1].Str(),
+		AllowedMentions: discordgo.AllowedMentions{
+			Roles: []int64{role.ID},
+		},
+	})
+
 	if err != nil {
 		return nil, err
 	}

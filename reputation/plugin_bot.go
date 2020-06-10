@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jonas747/dstate"
+	"github.com/jonas747/yagpdb/analytics"
 	"github.com/jonas747/yagpdb/bot/paginatedmessages"
 
 	"github.com/jonas747/dcmd"
@@ -23,7 +25,7 @@ var _ bot.BotInitHandler = (*Plugin)(nil)
 var _ commands.CommandProvider = (*Plugin)(nil)
 
 func (p *Plugin) AddCommands() {
-	commands.AddRootCommands(cmds...)
+	commands.AddRootCommands(p, cmds...)
 }
 
 func (p *Plugin) BotInit() {
@@ -35,7 +37,11 @@ var thanksRegex = regexp.MustCompile(`(?i)( |\n|^)(thanks?\pP*|danks|ty|thx|\+re
 func handleMessageCreate(evt *eventsystem.EventData) {
 	msg := evt.MessageCreate()
 
-	if msg.Author == nil || msg.WebhookID != 0 || len(msg.Mentions) < 1 || msg.GuildID == 0 || msg.Author.Bot {
+	if !bot.IsNormalUserMessage(msg.Message) {
+		return
+	}
+
+	if len(msg.Mentions) < 1 || msg.GuildID == 0 || msg.Author.Bot {
 		return
 	}
 
@@ -48,19 +54,19 @@ func handleMessageCreate(evt *eventsystem.EventData) {
 		return
 	}
 
+	if !evt.HasFeatureFlag(featureFlagThanksEnabled) {
+		return
+	}
+
 	conf, err := GetConfig(evt.Context(), msg.GuildID)
 	if err != nil || !conf.Enabled || conf.DisableThanksDetection {
 		return
 	}
 
 	target, err := bot.GetMember(msg.GuildID, who.ID)
-	sender, err2 := bot.GetMember(msg.GuildID, msg.Author.ID)
-	if err != nil || err2 != nil {
-		if err2 != nil {
-			err = err2
-		}
-
-		logger.WithError(err).Error("Failed retrieving bot member")
+	sender := dstate.MSFromDGoMember(evt.GS, msg.Member)
+	if err != nil {
+		logger.WithError(err).Error("Failed retrieving target member")
 		return
 	}
 
@@ -78,8 +84,10 @@ func handleMessageCreate(evt *eventsystem.EventData) {
 		return
 	}
 
-	content := fmt.Sprintf("Gave +1 %s to **%s**", conf.PointsName, who.Username)
-	common.BotSession.ChannelMessageSend(msg.ChannelID, common.EscapeSpecialMentions(content))
+	go analytics.RecordActiveUnit(msg.GuildID, &Plugin{}, "auto_add_rep")
+
+	content := fmt.Sprintf("Gave +1 %s to **%s**", conf.PointsName, who.Mention())
+	common.BotSession.ChannelMessageSend(msg.ChannelID, content)
 }
 
 var cmds = []*commands.YAGCommand{
@@ -126,8 +134,7 @@ var cmds = []*commands.YAGCommand{
 				return "An error occured while finding the server config", err
 			}
 
-			member := commands.ContextMS(parsed.Context())
-			if !IsAdmin(parsed.GS, member, conf) {
+			if !IsAdmin(parsed.GS, parsed.MS, conf) {
 				return "You're not a reputation admin. (no manage server perms and no rep admin role)", nil
 			}
 
@@ -138,7 +145,7 @@ var cmds = []*commands.YAGCommand{
 				targetUsername = targetMember.Username
 			}
 
-			err = SetRep(parsed.Context(), parsed.GS.ID, member.ID, targetID, int64(parsed.Args[1].Int()))
+			err = SetRep(parsed.Context(), parsed.GS.ID, parsed.MS.ID, targetID, int64(parsed.Args[1].Int()))
 			if err != nil {
 				return nil, err
 			}
@@ -160,8 +167,7 @@ var cmds = []*commands.YAGCommand{
 				return "An error occured while finding the server config", err
 			}
 
-			member, _ := bot.GetMember(parsed.GS.ID, parsed.Msg.Author.ID)
-			if !IsAdmin(parsed.GS, member, conf) {
+			if !IsAdmin(parsed.GS, parsed.MS, conf) {
 				return "You're not an reputation admin. (no manage servers perms and no rep admin role)", nil
 			}
 
@@ -191,8 +197,7 @@ var cmds = []*commands.YAGCommand{
 				return "An error occured while finding the server config", err
 			}
 
-			member, _ := bot.GetMember(parsed.GS.ID, parsed.Msg.Author.ID)
-			if member == nil || !IsAdmin(parsed.GS, member, conf) {
+			if !IsAdmin(parsed.GS, parsed.MS, conf) {
 				return "You're not an reputation admin. (no manage servers perms and no rep admin role)", nil
 			}
 
@@ -330,7 +335,7 @@ var cmds = []*commands.YAGCommand{
 				return nil, err
 			}
 
-			if len(entries) < 1 && p.LastResponse != nil { //Dont send No Results error on first execution
+			if len(entries) < 1 && p != nil && p.LastResponse != nil { //Dont send No Results error on first execution
 				return nil, paginatedmessages.ErrNoResults
 			}
 
@@ -371,13 +376,9 @@ func CmdGiveRep(parsed *dcmd.Data) (interface{}, error) {
 		return fmt.Sprintf("You can't modify your own %s... **Silly**", pointsName), nil
 	}
 
-	sender, err := bot.GetMember(parsed.GS.ID, parsed.Msg.Author.ID)
-	receiver, err2 := bot.GetMember(parsed.GS.ID, target.ID)
-	if err != nil || err2 != nil {
-		if err2 != nil {
-			err = err2
-		}
-
+	sender := parsed.MS
+	receiver, err := bot.GetMember(parsed.GS.ID, target.ID)
+	if err != nil {
 		return nil, err
 	}
 

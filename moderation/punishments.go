@@ -10,13 +10,13 @@ import (
 	"github.com/jinzhu/gorm"
 	"github.com/jonas747/discordgo"
 	"github.com/jonas747/dstate"
-	"github.com/jonas747/retryableredis"
 	"github.com/jonas747/yagpdb/bot"
 	"github.com/jonas747/yagpdb/common"
 	"github.com/jonas747/yagpdb/common/scheduledevents2"
 	seventsmodels "github.com/jonas747/yagpdb/common/scheduledevents2/models"
 	"github.com/jonas747/yagpdb/common/templates"
 	"github.com/jonas747/yagpdb/logs"
+	"github.com/mediocregopher/radix/v3"
 	"github.com/volatiletech/sqlboiler/queries/qm"
 )
 
@@ -142,8 +142,7 @@ func punish(config *Config, p Punishment, guildID int64, channel *dstate.Channel
 		}
 	}
 
-	actionChannel := config.IntActionChannel()
-	err = CreateModlogEmbed(actionChannel, author, action, user, reason, logLink)
+	err = CreateModlogEmbed(config, author, action, user, reason, logLink)
 	return err
 }
 
@@ -243,7 +242,7 @@ func DeleteMessages(channelID int64, filterUser int64, deleteNum, fetchNum int) 
 
 func BanUserWithDuration(config *Config, guildID int64, channel *dstate.ChannelState, message *discordgo.Message, author *discordgo.User, reason string, user *discordgo.User, duration time.Duration, deleteMessageDays int) error {
 	// Set a key in redis that marks that this user has appeared in the modlog already
-	common.RedisPool.Do(retryableredis.Cmd(nil, "SETEX", RedisKeyBannedUser(guildID, user.ID), "60", "1"))
+	common.RedisPool.Do(radix.Cmd(nil, "SETEX", RedisKeyBannedUser(guildID, user.ID), "60", "1"))
 	if deleteMessageDays > 7 {
 		deleteMessageDays = 7
 	}
@@ -376,7 +375,7 @@ func MuteUnmuteUser(config *Config, mute bool, guildID int64, channel *dstate.Ch
 
 		if alreadyMuted {
 			common.GORM.Delete(&currentMute)
-			common.RedisPool.Do(retryableredis.Cmd(nil, "DEL", RedisKeyMutedUser(guildID, member.ID)))
+			common.RedisPool.Do(radix.Cmd(nil, "DEL", RedisKeyMutedUser(guildID, member.ID)))
 		}
 	}
 
@@ -405,12 +404,7 @@ func MuteUnmuteUser(config *Config, mute bool, guildID int64, channel *dstate.Ch
 	}
 
 	// Create the modlog entry
-	logChannel, _ := strconv.ParseInt(config.ActionChannel, 10, 64)
-	if logChannel != 0 {
-		return CreateModlogEmbed(logChannel, author, action, member.DGoUser(), reason, logLink)
-	}
-
-	return nil
+	return CreateModlogEmbed(config, author, action, member.DGoUser(), reason, logLink)
 }
 
 func AddMemberMuteRole(config *Config, id int64, currentRoles []int64) (removedRoles []int64, err error) {
@@ -501,8 +495,7 @@ func WarnUser(config *Config, guildID int64, channel *dstate.ChannelState, msg *
 	// go bot.SendDM(target.ID, fmt.Sprintf("**%s**: You have been warned for: %s", bot.GuildName(guildID), message))
 
 	if config.WarnSendToModlog && config.ActionChannel != "" {
-		parsedActionChannel, _ := strconv.ParseInt(config.ActionChannel, 10, 64)
-		err = CreateModlogEmbed(parsedActionChannel, author, MAWarned, target, message, warning.LogsLink)
+		err = CreateModlogEmbed(config, author, MAWarned, target, message, warning.LogsLink)
 		if err != nil {
 			return common.ErrWithCaller(err)
 		}
